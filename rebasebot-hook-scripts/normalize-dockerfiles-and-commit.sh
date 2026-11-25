@@ -28,6 +28,8 @@ set -o pipefail  # Return the exit status of the last command in the pipe that f
 #     Red Hat builder images that don't pin patch versions.
 
 stage_and_commit(){
+    local message="${1:-UPSTREAM: <drop>: Normalize Go version in Dockerfiles}"
+
     if [[ -z "$REBASEBOT_GIT_USERNAME" || -z "$REBASEBOT_GIT_EMAIL" ]]; then
         author_flag=()
     else
@@ -36,7 +38,7 @@ stage_and_commit(){
 
     if [[ -n $(git status --porcelain) ]]; then
         git add -A
-        git commit "${author_flag[@]}" -q -m "UPSTREAM: <drop>: Normalize Go version in Dockerfiles"
+        git commit "${author_flag[@]}" -q -m "$message"
     fi
 }
 
@@ -87,4 +89,56 @@ normalize_dockerfiles() {
     stage_and_commit
 }
 
+sync_dockerfile_go_version() {
+    # Sync the Go version in Dockerfiles/Containerfiles/Tiltfiles with go.mod.
+    #
+    # Problem: When go.mod is bumped to a new minor version (e.g. go 1.25 -> go 1.26),
+    # the Dockerfiles still reference the old minor version (golang:1.25), causing
+    # CI failures like:
+    #   go: go.mod requires go >= 1.26.0 (running go 1.25.14; GOTOOLCHAIN=local)
+    #
+    # This runs AFTER normalize_dockerfiles (which strips patch versions) and updates
+    # the minor version to match go.mod.
+
+    if [ ! -f go.mod ]; then
+        echo "=== No go.mod found, skipping Go version sync ==="
+        return
+    fi
+
+    go_version=$(grep '^go ' go.mod | head -1 | awk '{print $2}')
+    if [ -z "$go_version" ]; then
+        echo "=== No go directive found in go.mod, skipping Go version sync ==="
+        return
+    fi
+
+    # Strip any remaining patch version (e.g. 1.26.3 -> 1.26)
+    go_minor=$(echo "$go_version" | sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+$/\1/')
+
+    echo "Syncing Dockerfile Go versions to match go.mod (go $go_minor)"
+
+    local changed=0
+
+    while IFS= read -r -d '' dockerfile; do
+        # Only process FROM lines that have a golang: image with a DIFFERENT
+        # minor version than what go.mod declares.
+        if grep -qE '(^|["[:space:]])[Ff][Rr][Oo][Mm][[:space:]].*\bgolang:[0-9]+\.[0-9]+' "$dockerfile"; then
+            # Check if any FROM line has a golang version that differs from go.mod
+            if grep -E '(^|["[:space:]])[Ff][Rr][Oo][Mm][[:space:]]' "$dockerfile" | grep -qv "golang:${go_minor}\b"; then
+                if grep -E '(^|["[:space:]])[Ff][Rr][Oo][Mm][[:space:]]' "$dockerfile" | grep -q '\bgolang:[0-9]'; then
+                    echo "=== Syncing $dockerfile to golang:$go_minor ==="
+                    sed -i -E '/(^|["[:space:]])[Ff][Rr][Oo][Mm][[:space:]]/s/\bgolang:[0-9]+\.[0-9]+/golang:'"$go_minor"'/g' "$dockerfile"
+                    changed=1
+                fi
+            fi
+        fi
+    done < <(find . \( -name 'Dockerfile*' -o -name 'Containerfile*' -o -name '*.Dockerfile' -o -name 'Tiltfile*' \) -not -path '*/vendor/*' -print0)
+
+    if [ "$changed" -eq 0 ]; then
+        echo "=== Dockerfile Go versions already match go.mod ==="
+    fi
+
+    stage_and_commit "UPSTREAM: <drop>: Sync Dockerfile Go version with go.mod"
+}
+
 normalize_dockerfiles
+sync_dockerfile_go_version
